@@ -99,10 +99,12 @@ let activeBackendHost = null;
 // --- RESILIENT BACKEND FETCH HELPER ---
 const fetchBackend = async (query, variables = {}, timeoutMs = 5000) => {
   // If we found a working host, try it first
+  // const hosts = activeBackendHost 
+  //   ? [activeBackendHost, "http://127.0.0.1:8000", "https://aegisbrowse.tarxemo.com"] 
+  //   : ["http://127.0.0.1:8000", "http://localhost:8000", "https://aegisbrowse.tarxemo.com"];
   const hosts = activeBackendHost 
-    ? [activeBackendHost, "http://127.0.0.1:8000", "https://aegisbrowse.tarxemo.com"] 
-    : ["http://127.0.0.1:8000", "http://localhost:8000", "https://aegisbrowse.tarxemo.com"];
-  
+    ? [activeBackendHost, "https://aegisbrowse.tarxemo.com"] 
+    : ["https://aegisbrowse.tarxemo.com"];
   // Remove duplicates
   const uniqueHosts = [...new Set(hosts)];
 
