@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "AegisBrowse",
+  "name": "AegiVara",
   "version": "1.0",
-  "description": "AegisBrowse is a browser activity tracker with real-time URL interception and GSAP-powered dashboard.",
+  "description": "AegiVara is a browser activity tracker with real-time URL interception and GSAP-powered dashboard.",
   "permissions": [
     "webRequest",
     "webNavigation",
