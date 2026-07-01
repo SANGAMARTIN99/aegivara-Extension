@@ -16,6 +16,23 @@ const isIgnorableUrl = (url) => {
   }
 };
 
+// A single page visit fires onCommitted + onBeforeRequest(main_frame) + onUpdated(complete)
+// within milliseconds of each other — dedupe so only one activity record (and one
+// potential backend AI-analysis task) is sent per real navigation, not three.
+const recentlyLoggedUrls = new Map(); // url -> last-logged timestamp (ms)
+const DEDUPE_WINDOW_MS = 4000;
+
+const isDuplicateLog = (url) => {
+  const now = Date.now();
+  const lastLogged = recentlyLoggedUrls.get(url);
+  if (lastLogged && now - lastLogged < DEDUPE_WINDOW_MS) return true;
+  recentlyLoggedUrls.set(url, now);
+  if (recentlyLoggedUrls.size > 200) {
+    recentlyLoggedUrls.delete(recentlyLoggedUrls.keys().next().value);
+  }
+  return false;
+};
+
 let cachedUserEmail  = null;
 let cachedDeviceId   = null;
 let cachedPairingToken = null;
@@ -80,6 +97,11 @@ const saveLog = async (logEntry) => {
 
   // Optional: Ignore noisy automated assets. ONLY track pure navigations and main requests.
   if (logEntry.type === 'request' && logEntry.resourceType !== 'main_frame') {
+    return;
+  }
+
+  // Collapse the navigation/request/load-complete triple-fire for the same URL
+  if (isDuplicateLog(logEntry.url)) {
     return;
   }
 
