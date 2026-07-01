@@ -75,6 +75,17 @@ const getTypeIcon = (type) => {
 const shortTime = (iso) => new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 const fullTime  = (iso) => new Date(iso).toLocaleTimeString();
 
+/** Build a DOM element safely — never uses innerHTML, so untrusted log data
+ * (URLs) can never be interpreted as markup. */
+const createEl = (tag, { className, text, title, attrs } = {}) => {
+    const el = document.createElement(tag);
+    if (className) el.className = className;
+    if (text !== undefined) el.textContent = text;
+    if (title !== undefined) el.title = title;
+    if (attrs) Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, v));
+    return el;
+};
+
 // ─────────────────────────────────────────
 // ICONS — re-render Lucide icons
 // ─────────────────────────────────────────
@@ -121,7 +132,7 @@ const renderDashboard = () => {
     list.innerHTML = '';
 
     if (!logs.length) {
-        list.innerHTML = `<div class="empty-state">${t('no_activity')}</div>`;
+        list.appendChild(createEl('div', { className: 'empty-state', text: t('no_activity') }));
         return;
     }
 
@@ -130,14 +141,18 @@ const renderDashboard = () => {
         const icon = getTypeIcon(log.type);
         const item = document.createElement('div');
         item.className = 'log-item';
-        item.innerHTML = `
-            <div class="log-icon ${cls}"><i data-lucide="${icon}"></i></div>
-            <div class="log-body">
-                <div class="log-type ${cls}">${log.type}</div>
-                <div class="log-url" title="${log.url}">${log.url}</div>
-            </div>
-            <div class="log-time">${shortTime(log.timestamp)}</div>
-        `;
+
+        const iconWrap = createEl('div', { className: `log-icon ${cls}` });
+        iconWrap.appendChild(createEl('i', { attrs: { 'data-lucide': icon } }));
+
+        const body = createEl('div', { className: 'log-body' });
+        body.appendChild(createEl('div', { className: `log-type ${cls}`, text: log.type }));
+        body.appendChild(createEl('div', { className: 'log-url', text: log.url, title: log.url }));
+
+        item.appendChild(iconWrap);
+        item.appendChild(body);
+        item.appendChild(createEl('div', { className: 'log-time', text: shortTime(log.timestamp) }));
+
         list.appendChild(item);
         // Stagger animation
         gsap.fromTo(item, { autoAlpha: 0, x: -10 }, { autoAlpha: 1, x: 0, duration: 0.3, delay: i * 0.05 });
@@ -156,7 +171,7 @@ const renderFeed = () => {
 
     container.innerHTML = '';
     if (!logs.length) {
-        container.innerHTML = `<div class="empty-state">${t('no_activity')}</div>`;
+        container.appendChild(createEl('div', { className: 'empty-state', text: t('no_activity') }));
     } else {
         const start    = (currentPage - 1) * ITEMS_PER_PAGE;
         const pageLogs = logs.slice(start, start + ITEMS_PER_PAGE);
@@ -165,13 +180,14 @@ const renderFeed = () => {
             const cls  = getTypeClass(log.type);
             const item = document.createElement('div');
             item.className = 'feed-item';
-            item.innerHTML = `
-                <div class="feed-item-header">
-                    <span class="feed-badge ${cls}">${log.type}</span>
-                    <span class="feed-time">${fullTime(log.timestamp)}</span>
-                </div>
-                <div class="feed-url" title="${log.url}">${log.url}</div>
-            `;
+
+            const header = createEl('div', { className: 'feed-item-header' });
+            header.appendChild(createEl('span', { className: `feed-badge ${cls}`, text: log.type }));
+            header.appendChild(createEl('span', { className: 'feed-time', text: fullTime(log.timestamp) }));
+
+            item.appendChild(header);
+            item.appendChild(createEl('div', { className: 'feed-url', text: log.url, title: log.url }));
+
             container.appendChild(item);
             gsap.fromTo(item, { autoAlpha: 0, y: 6 }, { autoAlpha: 1, y: 0, duration: 0.25, delay: i * 0.03 });
         });
