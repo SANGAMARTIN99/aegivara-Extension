@@ -1,5 +1,21 @@
 const MAX_LOGS = 1000;
 
+// Own-product domains + internal browser pages that should never be treated
+// as "user activity" (new-tab pages, the AegiVara dashboard/API itself, localhost dev servers).
+const IGNORED_SCHEMES = ['chrome://', 'edge://', 'about:', 'chrome-extension://', 'moz-extension://'];
+const IGNORED_HOSTS = ['aegis.tarxemo.com', 'aegisbrowse.tarxemo.com', 'localhost', '127.0.0.1'];
+
+const isIgnorableUrl = (url) => {
+  if (!url) return true;
+  if (IGNORED_SCHEMES.some(scheme => url.startsWith(scheme))) return true;
+  try {
+    const hostname = new URL(url).hostname.toLowerCase();
+    return IGNORED_HOSTS.some(h => hostname === h || hostname.endsWith('.' + h));
+  } catch (e) {
+    return false;
+  }
+};
+
 let cachedUserEmail  = null;
 let cachedDeviceId   = null;
 let cachedPairingToken = null;
@@ -57,11 +73,11 @@ const saveLog = async (logEntry) => {
 
   if (!trackingEnabled) return;
 
-  // Prevent infinite tracking loop of our own GraphQL backend endpoints
-  if (logEntry.url && (logEntry.url.includes('127.0.0.1:8000') || logEntry.url.includes('localhost:8000') || logEntry.url.includes('aegisbrowse.tarxemo.com'))) {
+  // Ignore new-tab/internal browser pages and AegiVara's own domains/localhost
+  if (isIgnorableUrl(logEntry.url)) {
     return;
   }
-  
+
   // Optional: Ignore noisy automated assets. ONLY track pure navigations and main requests.
   if (logEntry.type === 'request' && logEntry.resourceType !== 'main_frame') {
     return;
@@ -153,6 +169,42 @@ const fetchBackend = async (query, variables = {}, timeoutMs = 5000) => {
   // If we get here, all hosts failed. Clear the cache so we try from scratch next time
   activeBackendHost = null;
   throw new Error(`Critical: All backend hosts unreachable. Last error: ${lastError}`);
+};
+
+// --- REAL-TIME POLICY PUSH (WebSocket) ---
+// The dashboard broadcasts a 'policy_update' event over this socket the instant an
+// admin blocks/unblocks a domain, so enforcement doesn't wait for the 5-minute poll.
+// MV3 service workers can be evicted after ~30s idle, which drops the socket; the
+// 30s heartbeat alarm below re-opens it if needed, bounding the worst case at ~30s
+// while keeping the common case (SW alive while the user is browsing) near-instant.
+let policySocket = null;
+
+const connectPolicySocket = async () => {
+  if (policySocket && (policySocket.readyState === WebSocket.OPEN || policySocket.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+
+  const pairingToken = await getPairingToken();
+  if (!pairingToken) return;
+
+  try {
+    const httpHost = activeBackendHost || "https://aegisbrowse.tarxemo.com";
+    const wsHost = httpHost.replace(/^https:/, 'wss:').replace(/^http:/, 'ws:');
+    const socket = new WebSocket(`${wsHost}/ws/policy/?token=${encodeURIComponent(pairingToken)}`);
+
+    socket.onmessage = () => {
+      console.log("AegisBrowse: Real-time policy push received! Syncing...");
+      syncBlockedDomains();
+    };
+    socket.onerror = () => {};
+    socket.onclose = () => {
+      if (policySocket === socket) policySocket = null;
+    };
+
+    policySocket = socket;
+  } catch (e) {
+    policySocket = null;
+  }
 };
 
 const sendHeartbeat = async () => {
@@ -250,13 +302,6 @@ chrome.webNavigation.onCommitted.addListener((details) => {
 // Capture URL Requests
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
-    // PULSE INTERCEPTION: Real-time sync trigger from Dashboard
-    if (details.url.includes('aegis-pulse.local')) {
-      console.log("AegisBrowse: Real-time pulse received! Syncing...");
-      syncBlockedDomains();
-      return; 
-    }
-
     // Ignore internal extension requests
     if (details.url.startsWith('chrome-extension://')) return;
 
@@ -284,17 +329,28 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 // --- ENFORCEMENT ENGINE ---
 
 /**
+ * A policy item matches either as a whole domain (exact host or subdomain)
+ * or as a keyword (plain substring anywhere in the URL).
+ */
+const isUrlBlockedByItem = (url, hostname, item) => {
+  if (item.matchType === 'keyword') {
+    return url.toLowerCase().includes(item.domain);
+  }
+  return hostname === item.domain || hostname.endsWith('.' + item.domain);
+};
+
+/**
  * Scans all open tabs and redirects any that are now on a blocked domain.
  * This ensures that when a policy is updated, existing sessions are terminated immediately.
  */
-const enforcePolicyOnExistingTabs = async (blockedDomains) => {
-  if (!blockedDomains || blockedDomains.length === 0) return;
+const enforcePolicyOnExistingTabs = async (blockedData) => {
+  if (!blockedData || blockedData.length === 0) return;
 
   const settings = await chrome.storage.local.get(['trackingEnabled']);
   if (settings.trackingEnabled === false) return;
 
   console.log("AegisBrowse: Enforcing policy on existing tabs...");
-  
+
   const tabs = await chrome.tabs.query({});
   for (const tab of tabs) {
     if (!tab.url || tab.url.includes('blocked.html')) continue;
@@ -303,9 +359,7 @@ const enforcePolicyOnExistingTabs = async (blockedDomains) => {
       const url = new URL(tab.url);
       const hostname = url.hostname.toLowerCase();
 
-      const isBlocked = blockedDomains.some(domain => 
-        hostname === domain || hostname.endsWith('.' + domain)
-      );
+      const isBlocked = blockedData.some(item => isUrlBlockedByItem(tab.url, hostname, item));
 
       if (isBlocked) {
         console.warn("AegisBrowse: Terminating existing session for:", tab.url);
@@ -334,20 +388,25 @@ const updateBlockingRules = async (blockedData) => {
        return;
     }
 
-    const rules = blockedData.map((item, index) => ({
+    // Never build a rule for AegiVara's own domains/localhost, even if a stale
+    // policy entry somehow contains one — avoids ever locking the admin out.
+    const safeBlockedData = blockedData.filter(item => !IGNORED_HOSTS.includes(item.domain));
+
+    const rules = safeBlockedData.map((item, index) => ({
       id: index + 100,
       priority: 1,
-      action: { 
-        type: 'redirect', 
-        redirect: { 
-          url: chrome.runtime.getURL('blocked.html') + 
-               '?url=' + encodeURIComponent(item.domain) + 
+      action: {
+        type: 'redirect',
+        redirect: {
+          url: chrome.runtime.getURL('blocked.html') +
+               '?url=' + encodeURIComponent(item.domain) +
                '&reason=' + encodeURIComponent(item.reason || "Security Policy")
-        } 
+        }
       },
-      condition: { 
-        urlFilter: `||${item.domain}^`, 
-        resourceTypes: ['main_frame'] 
+      condition: {
+        urlFilter: item.matchType === 'keyword' ? item.domain : `||${item.domain}^`,
+        isUrlFilterCaseSensitive: false,
+        resourceTypes: ['main_frame']
       }
     }));
 
@@ -358,12 +417,11 @@ const updateBlockingRules = async (blockedData) => {
       removeRuleIds: oldIds,
       addRules: rules
     });
-    
+
     console.log("AegisBrowse: Enhanced Rules Updated", rules.length);
-    
+
     // ENFORCEMENT: Immediately scan existing tabs and redirect if they match the new policy
-    const blockedDomains = blockedData.map(d => d.domain);
-    enforcePolicyOnExistingTabs(blockedDomains);
+    enforcePolicyOnExistingTabs(safeBlockedData);
 
   } catch (err) {
     console.error("AegisBrowse: Failed to update declarative rules:", err);
@@ -379,6 +437,7 @@ const syncBlockedDomains = async (retryCount = 0) => {
         id
         domain
         reason
+        matchType
       }
     }
   `;
@@ -389,12 +448,10 @@ const syncBlockedDomains = async (retryCount = 0) => {
     if (result && result.data && result.data.allBlockedDomains) {
       const blockedData = result.data.allBlockedDomains.map(d => ({
         domain: d.domain.toLowerCase().trim(),
-        reason: d.reason
+        reason: d.reason,
+        matchType: d.matchType === 'keyword' ? 'keyword' : 'domain'
       }));
-      await chrome.storage.local.set({
-        blockedData,
-        blockedDomains: blockedData.map(d => d.domain)
-      });
+      await chrome.storage.local.set({ blockedData });
       console.log("AegisBrowse: Policy data updated", blockedData.length);
       await updateBlockingRules(blockedData);
     }
@@ -414,6 +471,7 @@ const syncBlockedDomains = async (retryCount = 0) => {
 setTimeout(() => {
   syncBlockedDomains();
   sendHeartbeat();
+  connectPolicySocket();
 }, 2000);
 
 // Listen for alarms
@@ -423,6 +481,8 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
   if (alarm.name === 'heartbeat') {
     sendHeartbeat();
+    // Also doubles as the socket-reconnect tick if it got dropped while the SW was idle.
+    connectPolicySocket();
   }
 });
 
@@ -434,19 +494,17 @@ chrome.alarms.create('heartbeat', { periodInMinutes: 0.5 });
 
 // Domain blocking listener (Backup for declarativeNetRequest)
 chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
-  if (details.frameId !== 0) return; 
+  if (details.frameId !== 0) return;
 
-  const { trackingEnabled, blockedDomains } = await chrome.storage.local.get(['trackingEnabled', 'blockedDomains']);
+  const { trackingEnabled, blockedData } = await chrome.storage.local.get(['trackingEnabled', 'blockedData']);
   if (trackingEnabled === false) return; // Surveillance is deactivated
-  if (!blockedDomains || blockedDomains.length === 0) return;
+  if (!blockedData || blockedData.length === 0) return;
 
   try {
     const url = new URL(details.url);
     const hostname = url.hostname.toLowerCase();
 
-    const isBlocked = blockedDomains.some(domain => 
-      hostname === domain || hostname.endsWith('.' + domain)
-    );
+    const isBlocked = blockedData.some(item => isUrlBlockedByItem(details.url, hostname, item));
 
     if (isBlocked && !details.url.includes('blocked.html')) {
       console.warn("AegisBrowse: Redirection active for:", details.url);
@@ -472,6 +530,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // Immediately send a heartbeat to claim the token
     sendHeartbeat();
     syncBlockedDomains();
+    if (policySocket) { policySocket.close(); policySocket = null; }
+    connectPolicySocket();
   }
 });
 
