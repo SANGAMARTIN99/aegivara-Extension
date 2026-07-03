@@ -33,6 +33,37 @@ const isDuplicateLog = (url) => {
   return false;
 };
 
+// Blocked events get their own, much longer cooldown. DNR and the backup
+// onBeforeNavigate listener can both redirect the same navigation attempt (a
+// race, not two separate blocks), and a page that keeps retrying a blocked
+// resource would otherwise write a fresh "Blocked" row every time. One row per
+// site per cooldown is enough signal for the dashboard; once the cooldown
+// elapses, the next attempt writes a fresh row — a natural "is this still
+// blocked?" recheck, since a domain that got unblocked in the meantime simply
+// stops producing Blocked events entirely.
+const recentlyBlockedSites = new Map(); // site key -> last-logged timestamp (ms)
+const BLOCKED_DEDUPE_WINDOW_MS = 5 * 60 * 1000;
+
+const blockedSiteKey = (url) => {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch (e) {
+    return url; // domain/keyword string with no scheme (DNR redirects use these raw)
+  }
+};
+
+const isDuplicateBlockedLog = (url) => {
+  const key = blockedSiteKey(url);
+  const now = Date.now();
+  const lastLogged = recentlyBlockedSites.get(key);
+  if (lastLogged && now - lastLogged < BLOCKED_DEDUPE_WINDOW_MS) return true;
+  recentlyBlockedSites.set(key, now);
+  if (recentlyBlockedSites.size > 200) {
+    recentlyBlockedSites.delete(recentlyBlockedSites.keys().next().value);
+  }
+  return false;
+};
+
 let cachedUserEmail  = null;
 let cachedDeviceId   = null;
 let cachedPairingToken = null;
@@ -100,8 +131,13 @@ const saveLog = async (logEntry) => {
     return;
   }
 
-  // Collapse the navigation/request/load-complete triple-fire for the same URL
-  if (isDuplicateLog(logEntry.url)) {
+  // Collapse the navigation/request/load-complete triple-fire for the same URL.
+  // Blocked events use their own longer-cooldown dedupe (see isDuplicateBlockedLog)
+  // instead of the general one, since a "Safe" request log for this URL was very
+  // likely already recorded microseconds earlier and would otherwise suppress it.
+  if (logEntry.status === 'Blocked') {
+    if (isDuplicateBlockedLog(logEntry.url)) return;
+  } else if (isDuplicateLog(logEntry.url)) {
     return;
   }
 
@@ -275,8 +311,11 @@ const syncToDjango = async (logEntry) => {
     }
   `;
 
-  let status = "Safe";
-  if (logEntry.url && logEntry.url.includes('blocked.html')) status = "Blocked";
+  // Blocked events set logEntry.status explicitly (see the onCommitted handler
+  // below). The old `url.includes('blocked.html')` check never matched because
+  // by the time a log reaches here, the URL has already been swapped back to the
+  // real site the user tried to visit — never the chrome-extension:// interstitial.
+  let status = logEntry.status || "Safe";
 
   let extractedTitle = logEntry.title || "Unknown Title";
   if (extractedTitle === "Unknown Title" || extractedTitle === "Page Navigation") {
@@ -310,15 +349,38 @@ const syncToDjango = async (logEntry) => {
 };
 
 // Track Navigations
+const BLOCKED_PAGE_URL = chrome.runtime.getURL('blocked.html');
+
 chrome.webNavigation.onCommitted.addListener((details) => {
-  if (details.frameId === 0) { // Only main frame
-    saveLog({
-      type: 'navigation',
-      url: details.url,
-      transitionType: details.transitionType,
-      title: 'Page Navigation' // Titles are harder to get here, content scripts or tabs API needed
-    });
+  if (details.frameId !== 0) return; // Only main frame
+
+  // Landing on our own interstitial means a block just happened. isIgnorableUrl()
+  // would otherwise drop this navigation entirely (chrome-extension:// scheme),
+  // which is why no "Blocked" record was ever reaching the backend. Recover the
+  // real site the user tried to visit from the redirect's query params and log
+  // THAT, with an explicit Blocked status.
+  if (details.url.startsWith(BLOCKED_PAGE_URL)) {
+    try {
+      const params = new URL(details.url).searchParams;
+      const blockedUrl = params.get('url') || 'unknown';
+      const reason = params.get('reason') || 'Security Policy';
+      saveLog({
+        type: 'blocked',
+        url: blockedUrl,
+        title: 'Blocked: ' + blockedUrl,
+        status: 'Blocked',
+        reason
+      });
+    } catch (e) {}
+    return;
   }
+
+  saveLog({
+    type: 'navigation',
+    url: details.url,
+    transitionType: details.transitionType,
+    title: 'Page Navigation' // Titles are harder to get here, content scripts or tabs API needed
+  });
 });
 
 // Capture URL Requests
